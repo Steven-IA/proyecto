@@ -1,0 +1,268 @@
+import argparse
+import hashlib
+import math
+import os
+import sqlite3
+import numpy as np
+import pandas as pd
+
+GENERATOR_VERSION = "v3.0.0"
+ORIGINAL_PATH = os.path.join("data", "network_behavior.csv")
+OUTPUT_DEFAULT = os.path.join("data", "network_behavior_v3.csv")
+QUARANTINE_DEFAULT = os.path.join("data", "network_behavior_v3_quarantine.csv")
+FEATURE_COLUMNS = ["conn_count", "conn_freq", "ports", "bytes_sent", "bytes_recv", "duration", "activity_var", "comm_freq"]
+LABEL_COLUMN = "label"
+METADATA_COLUMNS = ["data_source", "scenario", "generator_version", "seed", "family_id"]
+
+
+def _finite(value):
+    try:
+        return not (isinstance(value, float) and (math.isnan(value) or math.isinf(value)))
+    except Exception:
+        return False
+
+
+def validate_network_row(row):
+    try:
+        for col in FEATURE_COLUMNS:
+            value = row[col]
+            if pd.isna(value) or not _finite(value):
+                return False
+            if float(value) < 0:
+                return False
+        if int(row[LABEL_COLUMN]) not in (0, 1):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _feature_hash(values):
+    payload = "|".join(repr(float(v)) for v in values)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _init_hash_db(path):
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE IF NOT EXISTS hashes (h TEXT PRIMARY KEY)")
+    conn.commit()
+    return conn
+
+
+def _rebuild_hash_db(output_path, hash_db_path):
+    conn = _init_hash_db(hash_db_path)
+    conn.execute("DELETE FROM hashes")
+    conn.commit()
+    if os.path.exists(output_path):
+        for chunk in pd.read_csv(output_path, chunksize=50000):
+            hashes = [_feature_hash(tuple(row)) for row in chunk[FEATURE_COLUMNS + [LABEL_COLUMN]].itertuples(index=False, name=None)]
+            conn.executemany("INSERT OR IGNORE INTO hashes (h) VALUES (?)", [(h,) for h in hashes])
+            conn.commit()
+    return conn
+
+
+def _load_or_create_hash_db(output_path, hash_db_path):
+    if os.path.exists(hash_db_path):
+        return _init_hash_db(hash_db_path)
+    return _rebuild_hash_db(output_path, hash_db_path)
+
+
+def generate_network_batch(n: int, seed: int, family_id: str) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    # Scenario is context, not a direct label proxy.
+    scenarios = rng.choice(["baseline", "burst", "steady", "sparse"], size=n, p=[0.3, 0.25, 0.25, 0.2])
+    parts = []
+    for scenario in ("baseline", "burst", "steady", "sparse"):
+        mask = scenarios == scenario
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        if scenario == "baseline":
+            conn_count = rng.normal(80, 50, count)
+            conn_freq = rng.normal(12, 8, count)
+            ports = rng.normal(8, 5, count)
+            bytes_sent = rng.normal(2200, 1200, count)
+            bytes_recv = rng.normal(1800, 1000, count)
+            duration = rng.normal(22, 14, count)
+            activity_var = rng.normal(8, 5, count)
+            comm_freq = rng.normal(12, 8, count)
+        elif scenario == "burst":
+            conn_count = rng.normal(100, 55, count)
+            conn_freq = rng.normal(25, 14, count)
+            ports = rng.normal(12, 6, count)
+            bytes_sent = rng.normal(3000, 1600, count)
+            bytes_recv = rng.normal(3100, 1400, count)
+            duration = rng.normal(35, 17, count)
+            activity_var = rng.normal(14, 7, count)
+            comm_freq = rng.normal(24, 12, count)
+        elif scenario == "steady":
+            conn_count = rng.normal(85, 50, count)
+            conn_freq = rng.normal(14, 8, count)
+            ports = rng.normal(9, 5, count)
+            bytes_sent = rng.normal(2600, 1300, count)
+            bytes_recv = rng.normal(2100, 1000, count)
+            duration = rng.normal(28, 14, count)
+            activity_var = rng.normal(9, 5, count)
+            comm_freq = rng.normal(14, 8, count)
+        else:
+            conn_count = rng.normal(60, 35, count)
+            conn_freq = rng.normal(7, 5, count)
+            ports = rng.normal(5, 3, count)
+            bytes_sent = rng.normal(1000, 500, count)
+            bytes_recv = rng.normal(850, 450, count)
+            duration = rng.normal(15, 9, count)
+            activity_var = rng.normal(4, 3, count)
+            comm_freq = rng.normal(8, 5, count)
+
+        # Correlated adjustments.
+        bytes_sent = bytes_sent + conn_count * 5
+        bytes_recv = bytes_recv + conn_count * 4
+        comm_freq = comm_freq + ports * 0.5
+
+        conn_count = np.clip(conn_count, 0, None)
+        conn_freq = np.clip(conn_freq, 0, None)
+        ports = np.clip(ports, 0, None)
+        bytes_sent = np.clip(bytes_sent, 0, None)
+        bytes_recv = np.clip(bytes_recv, 0, None)
+        duration = np.clip(duration, 0, None)
+        activity_var = np.clip(activity_var, 0, None)
+        comm_freq = np.clip(comm_freq, 0, None)
+
+        # Latent score with overlap and noise.
+        score = (
+            conn_count / 100.0
+            + conn_freq / 20.0
+            + ports / 10.0
+            + bytes_sent / 3000.0
+            + bytes_recv / 2500.0
+            + duration / 30.0
+            + activity_var / 10.0
+            + comm_freq / 20.0
+        )
+        # Scenario-relative threshold to avoid scenario becoming a direct proxy.
+        threshold = np.median(score)
+        labels = (score > threshold).astype(int)
+        # Controlled noise to reduce artificial separability.
+        flip = rng.random(count) < 0.08
+        labels = np.where(flip, 1 - labels, labels)
+
+        part = pd.DataFrame({
+            "conn_count": conn_count,
+            "conn_freq": conn_freq,
+            "ports": ports,
+            "bytes_sent": bytes_sent,
+            "bytes_recv": bytes_recv,
+            "duration": duration,
+            "activity_var": activity_var,
+            "comm_freq": comm_freq,
+            "label": labels,
+            "data_source": "synthetic_v3",
+            "scenario": scenario,
+            "generator_version": GENERATOR_VERSION,
+            "seed": seed,
+            "family_id": family_id,
+        })
+        parts.append(part)
+
+    batch = pd.concat(parts, ignore_index=True)
+    batch = batch.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    mask = batch.apply(validate_network_row, axis=1)
+    rejected = int((~mask).sum())
+    batch = batch[mask].reset_index(drop=True)
+    batch = batch.drop_duplicates(subset=FEATURE_COLUMNS + [LABEL_COLUMN]).reset_index(drop=True)
+    if rejected:
+        print(f"Lote {seed}: {rejected} registros rechazados por validación", flush=True)
+    return batch
+
+
+def generate_expanded_dataset(output_path: str, original_path: str, n_new: int, batch_size: int = 50000, seed: int = 3025, resume: bool = False, family_size: int = 100):
+    hash_db_path = output_path + ".hashes.sqlite"
+    original_quarantine_path = original_path.replace(".csv", "_v3_quarantine.csv")
+
+    if not os.path.exists(output_path) or not resume:
+        original = pd.read_csv(original_path)
+        valid_mask = original.apply(validate_network_row, axis=1)
+        valid_original = original[valid_mask].copy()
+        invalid_original = original[~valid_mask].copy()
+
+        if not invalid_original.empty:
+            invalid_original.to_csv(original_quarantine_path, index=False, mode="w")
+            print(f"Registros originales en cuarentena: {len(invalid_original)}", flush=True)
+
+        valid_original = valid_original.copy()
+        valid_original = valid_original.copy()
+        valid_original["data_source"] = "original"
+        valid_original["scenario"] = "original"
+        valid_original["generator_version"] = "original"
+        valid_original["seed"] = 42
+        valid_original["family_id"] = [f"original_{i}" for i in range(len(valid_original))]
+        valid_original.to_csv(output_path, index=False, mode="w")
+        print(f"Registros originales válidos conservados: {len(valid_original)}", flush=True)
+
+        conn = sqlite3.connect(hash_db_path)
+        conn.execute("CREATE TABLE IF NOT EXISTS hashes (h TEXT PRIMARY KEY)")
+        conn.execute("DELETE FROM hashes")
+        conn.commit()
+        hashes = [_feature_hash(tuple(row)) for row in valid_original[FEATURE_COLUMNS + [LABEL_COLUMN]].itertuples(index=False, name=None)]
+        conn.executemany("INSERT OR IGNORE INTO hashes (h) VALUES (?)", [(h,) for h in hashes])
+        conn.commit()
+    else:
+        conn = sqlite3.connect(hash_db_path)
+        conn.execute("CREATE TABLE IF NOT EXISTS hashes (h TEXT PRIMARY KEY)")
+        conn.commit()
+
+    seen = set(row[0] for row in conn.execute("SELECT h FROM hashes").fetchall())
+    total_accepted = 0
+    duplicates = 0
+    current_seed = seed
+    max_attempts = n_new * 3 + 1000
+    attempts = 0
+    while total_accepted < n_new and attempts < max_attempts:
+        attempts += 1
+        n = min(batch_size, n_new - total_accepted + 100)
+        batch = generate_network_batch(n, current_seed, f"net_v3_family_{current_seed}")
+        current_seed += 1
+        # Assign family_id by chunks of family_size, not by whole batch.
+        family_ids = [f"net_v3_family_{current_seed - 1}_{i // family_size}" for i in range(len(batch))]
+        batch["family_id"] = family_ids
+        accepted_rows = []
+        for row in batch.itertuples(index=False, name=None):
+            values = list(row[:len(FEATURE_COLUMNS) + 1])
+            h = _feature_hash(values)
+            if h in seen:
+                duplicates += 1
+                continue
+            seen.add(h)
+            accepted_rows.append(row)
+            if total_accepted + len(accepted_rows) >= n_new:
+                break
+
+        if accepted_rows:
+            out_df = pd.DataFrame(accepted_rows, columns=FEATURE_COLUMNS + [LABEL_COLUMN] + METADATA_COLUMNS)
+            out_df.to_csv(output_path, index=False, mode="a", header=False)
+            conn.executemany("INSERT OR IGNORE INTO hashes (h) VALUES (?)", [(_feature_hash(list(r[:len(FEATURE_COLUMNS)+1])),) for r in accepted_rows])
+            conn.commit()
+            total_accepted += len(accepted_rows)
+            print(f"Generados {total_accepted}/{n_new} registros nuevos (duplicados descartados: {duplicates})", flush=True)
+
+    conn.close()
+    print(f"Dataset ampliado guardado en {output_path}")
+    print(f"Registros nuevos aceptados: {total_accepted}")
+    print(f"Duplicados descartados: {duplicates}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rows", type=int, default=1000000)
+    parser.add_argument("--output", type=str, default=OUTPUT_DEFAULT)
+    parser.add_argument("--original", type=str, default=ORIGINAL_PATH)
+    parser.add_argument("--batch-size", type=int, default=50000)
+    parser.add_argument("--seed", type=int, default=3025)
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+    generate_expanded_dataset(args.output, args.original, args.rows, args.batch_size, args.seed, args.resume)
+
+
+if __name__ == "__main__":
+    main()

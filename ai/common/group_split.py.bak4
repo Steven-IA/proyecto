@@ -1,0 +1,49 @@
+import numpy as np
+import pandas as pd
+
+def make_group_key(df, columns):
+    return df[columns].astype(str).agg("|".join, axis=1)
+
+def _hash_split(groups, seed, test_size, val_size):
+    # Deterministic fallback when sklearn is unavailable.
+    rng = np.random.default_rng(seed)
+    unique_groups = sorted(set(groups))
+    rng.shuffle(unique_groups)
+    n = len(unique_groups)
+    n_test = max(1, int(n * test_size))
+    n_val = max(1, int(n * val_size))
+    test_groups = set(unique_groups[:n_test])
+    val_groups = set(unique_groups[n_test:n_test + n_val])
+    train_groups = set(unique_groups[n_test + n_val:])
+    train_idx = [i for i, g in enumerate(groups) if g in train_groups]
+    val_idx = [i for i, g in enumerate(groups) if g in val_groups]
+    test_idx = [i for i, g in enumerate(groups) if g in test_groups]
+    return train_idx, val_idx, test_idx
+
+def split_by_group(df, group_columns, test_size=0.15, val_size=0.15, seed=42, label_col="label"):
+    groups = make_group_key(df, group_columns)
+    try:
+        from sklearn.model_selection import GroupShuffleSplit
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        train_val_idx, test_idx = next(gss.split(df, df[label_col], groups))
+        train_val_df = df.iloc[train_val_idx].copy()
+        test_df = df.iloc[test_idx].copy()
+        groups_tv = make_group_key(train_val_df, group_columns)
+        gss2 = GroupShuffleSplit(n_splits=1, test_size=val_size / (1 - test_size), random_state=seed + 1)
+        train_idx, val_idx = next(gss2.split(train_val_df, train_val_df[label_col], groups_tv))
+        train_df = train_val_df.iloc[train_idx].copy()
+        val_df = train_val_df.iloc[val_idx].copy()
+        return train_df, val_df, test_df
+    except Exception:
+        train_idx, val_idx, test_idx = _hash_split(groups.tolist(), seed, test_size, val_size)
+        return df.iloc[train_idx].copy(), df.iloc[val_idx].copy(), df.iloc[test_idx].copy()
+
+def check_group_leakage(train_df, val_df, test_df, group_columns):
+    train_groups = set(make_group_key(train_df, group_columns))
+    val_groups = set(make_group_key(val_df, group_columns))
+    test_groups = set(make_group_key(test_df, group_columns))
+    return {
+        "train_val_overlap": len(train_groups & val_groups),
+        "train_test_overlap": len(train_groups & test_groups),
+        "val_test_overlap": len(val_groups & test_groups),
+    }

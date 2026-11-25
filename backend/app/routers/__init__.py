@@ -1,0 +1,16 @@
+from .health import router as health_router
+from .devices import router as devices_router
+from .discovery import router as discovery_router
+from .availability import router as availability_router
+from .security import router as security_router
+from .inference import router as inference_router
+from .vulnerabilities import router as vuln_router
+from .alerts import router as alerts_router
+from .reports import router as reports_router
+from .training import router as training_router
+from .history import router as history_router
+from .settings import router as settings_router
+from .discovery_requests import router as discovery_requests_router
+from .agent import router as agent_router
+from .ai import router as ai_router
+from .telemetry import router as telemetry_router

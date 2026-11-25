@@ -1,0 +1,73 @@
+import argparse
+import os
+import numpy as np
+import pandas as pd
+
+NETWORK_FEATURES = ["conn_count", "conn_freq", "ports", "bytes_sent", "bytes_recv", "duration", "activity_var", "comm_freq"]
+SECURITY_FEATURES = ["firewall", "antivirus", "pending_updates", "os_age", "outdated", "vuln_apps", "excessive", "unnecessary", "unverified"]
+METADATA = ["data_source", "scenario", "generator_version", "seed", "family_id"]
+
+
+def validate(path, features, label_col="label"):
+    print("=" * 80)
+    print("Archivo:", path)
+    df = pd.read_csv(path)
+    print("Shape:", df.shape)
+    print("Columnas:", list(df.columns))
+    missing = [c for c in features + [label_col] + METADATA if c not in df.columns]
+    print("Columnas faltantes:", missing)
+    print("Nulos:", int(df.isna().sum().sum()))
+    print("Infinitos:", int(np.isinf(df[features].select_dtypes(include=[np.number])).sum().sum()))
+    print("Duplicados exactos:", int(df.duplicated().sum()))
+    print("Duplicados por características:", int(df.duplicated(subset=features).sum()))
+    print("Distribución de etiquetas:", df[label_col].value_counts().to_dict())
+    print("Distribución por scenario:", df["scenario"].value_counts().to_dict())
+    print("Distribución por data_source:", df["data_source"].value_counts().to_dict())
+    print("Cardinalidad:", df[features].nunique().to_dict())
+    print("Varianza:", df[features].var().to_dict())
+    corr = df[features + [label_col]].corr()[label_col].drop(label_col)
+    print("Correlación con etiqueta:", corr.to_dict())
+    print("Mínimos:", df[features].min().to_dict())
+    print("Máximos:", df[features].max().to_dict())
+    print("Crosstab scenario/label:")
+    print(pd.crosstab(df["scenario"], df[label_col]).to_dict())
+    # NMI manual for scenario vs label
+    try:
+        contingency = pd.crosstab(df["scenario"], df[label_col])
+        n = contingency.to_numpy().astype(float)
+        total = n.sum()
+        px = n.sum(axis=1) / total
+        py = n.sum(axis=0) / total
+        pxy = n / total
+        mi = 0.0
+        for i in range(n.shape[0]):
+            for j in range(n.shape[1]):
+                if pxy[i, j] > 0:
+                    mi += pxy[i, j] * np.log(pxy[i, j] / (px[i] * py[j]))
+        hx = -sum(p * np.log(p) for p in px if p > 0)
+        hy = -sum(p * np.log(p) for p in py if p > 0)
+        nmi = mi / ((hx + hy) / 2) if (hx + hy) > 0 else 0.0
+        print("NMI manual scenario->label:", float(nmi))
+    except Exception as e:
+        print("NMI manual error:", e)
+    try:
+        from sklearn.feature_selection import mutual_info_classif
+        mi = mutual_info_classif(df[["scenario"]].astype("category").cat.codes.values.reshape(-1, 1), df[label_col], discrete_features=True)
+        print("Mutual info (sklearn) scenario->label:", float(mi[0]))
+    except Exception as e:
+        print("Mutual info sklearn no disponible:", e)
+    print("-" * 80)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--network", type=str, default=None)
+    parser.add_argument("--security", type=str, default=None)
+    args = parser.parse_args()
+    if args.network:
+        validate(args.network, NETWORK_FEATURES)
+    if args.security:
+        validate(args.security, SECURITY_FEATURES)
+
+if __name__ == "__main__":
+    main()

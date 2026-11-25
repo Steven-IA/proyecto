@@ -1,0 +1,24 @@
+{
+  "accuracy": 0.9666666666666667,
+  "val_accuracy": 0.9844444444444445,
+  "confusion_matrix": [
+    [
+      144,
+      4,
+      0
+    ],
+    [
+      2,
+      141,
+      6
+    ],
+    [
+      0,
+      3,
+      150
+    ]
+  ],
+  "dataset": "synthetic (laboratorio)",
+  "split": "70/15/15 train/val/test, scaler ajustado solo en train",
+  "limitation": "Etiquetas derivadas de reglas; no evidencia de riesgo real confirmado."
+}
